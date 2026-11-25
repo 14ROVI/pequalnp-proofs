@@ -99,6 +99,8 @@ export function gitIn(dir, auth) {
   const base = ['-c', 'core.hooksPath=/dev/null', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', '-c', `protocol.file.allow=${process.env.LAND_TEST_FILE_TRANSPORT === '1' ? 'always' : 'never'}`, '-C', dir];
   const git = (args, opts = {}) => execFileSync('git', base.concat(args), { env: { ...env, ...(opts.env || {}) }, encoding: 'utf8', maxBuffer: 8 << 20, stdio: ['ignore', 'pipe', 'pipe'], timeout: opts.timeout ?? 120000 }).replace(/\n$/, '');
   git.ok = (args, opts) => { try { git(args, opts); return true; } catch { return false; } };
+  // A call whose output is read whether or not it succeeds (git push --porcelain prints its status lines on a refusal too).
+  git.out = (args, opts = {}) => { try { return { ok: true, out: git(args, opts) }; } catch (e) { return { ok: false, out: String(e.stdout ?? '') }; } };
   return git;
 }
 
@@ -172,7 +174,25 @@ export function apiParents(repo, auth) {
   };
 }
 
-export function run({ dir, remote, listJson, extraNames, auth, parentsOf, log = console.log }) {
+// THE PUSH, RETRIED ON A FAST-FORWARD REFUSAL ONLY (red team, both seats, 25 Nov): main moves every few seconds while the
+// squash path merges, so a chain built on one tip is often refused as not a fast-forward. The refusal is read from git's
+// own machine status (`git push --porcelain`: flag "!", "[rejected]" with "fetch first" or "non-fast-forward"), never from
+// a server's text; any other refusal is a FAULT at once. Each retry fetches main fresh, reads every head again and reruns
+// EVERY check from the start against the new tip, so a head whose path a squash landing put on main meanwhile is LEFT OUT
+// (back to the squash path), never pushed over. At most MAX_TRIES tries, a short random wait between, a total time bound
+// well inside the job's twenty minutes; never a force. One line per attempt; "landed" only after the push that went through.
+export const MAX_TRIES = 10, TOTAL_MS = 5 * 60 * 1000;
+export function pushStatus(out) {
+  // 'pushed' | 'fast-forward' | 'other', from the porcelain status line of refs/heads/main.
+  const line = String(out || '').split('\n').find((l) => l.split('\t')[1]?.endsWith(':refs/heads/main'));
+  if (!line) return 'other';
+  const [flag, , summary = ''] = line.split('\t');
+  if ([' ', '+', '*', '='].includes(flag)) return 'pushed';
+  if (flag === '!' && /^\[rejected\] \((fetch first|non-fast-forward)\)$/.test(summary.trim())) return 'fast-forward';
+  return 'other';
+}
+const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+export function run({ dir, remote, listJson, extraNames, auth, parentsOf, log = console.log, beforePush = () => {}, maxTries = MAX_TRIES, totalMs = TOTAL_MS, waitMs = () => 500 + Math.floor(Math.random() * 2500) }) {
   const list = parseList(listJson);
   const names = reserved(extraNames);
   const git = gitIn(dir, auth);
@@ -180,8 +200,10 @@ export function run({ dir, remote, listJson, extraNames, auth, parentsOf, log = 
   git(['remote', 'add', 'origin', remote]);
   const fetchMain = () => { git(['fetch', '-q', '--no-tags', '--no-recurse-submodules', 'origin', '+refs/heads/main:refs/land/main']); return git(['rev-parse', 'refs/land/main']); };
   let tip0 = fetchMain();
+  const began = Date.now();
   // A head is fetched only after its parent, read through the API, is shown to be on main: such a head brings one
   // commit, its trees and one file. A fetch that fails or takes over 30 seconds leaves that entry out (red team, 20:13Z).
+  const readHeads = () => {
   const heads = {};
   for (const e of list) {
     let parents;
@@ -201,16 +223,24 @@ export function run({ dir, remote, listJson, extraNames, auth, parentsOf, log = 
       if (n > 16) heads[e.pr] = 'too many objects';
     }
   }
-  for (let attempt = 0; attempt < 2; attempt++) {
+  return heads;
+  };
+  for (let attempt = 1; ; attempt++) {
+    if (attempt > 1) tip0 = fetchMain();   // a fresh main, then every head and every check again, from the start
+    const heads = readHeads();
     const { tip, results } = buildChain(git, list, heads, tip0, names);
     // Each entry's line is printed BEFORE the push, so a refused push still shows what was judged (rehearsal 1).
     log(report(results));
-    if (!results.some((r) => r.landed)) { log('nothing to land: no push'); return results; }
-    if (git.ok(['push', '-q', 'origin', `${tip}:refs/heads/main`])) { log('pushed: these heads are on main'); log(results.filter((r) => r.landed).map((r) => `landed #${r.pr}`).join('\n')); return results; }
-    log('the push was refused');
-    if (attempt === 0) { log('rebuilding once on a fresh read of main'); tip0 = fetchMain(); }
+    if (!results.some((r) => r.landed)) { log(`attempt ${attempt}: tip ${tip0.slice(0, 10)}: nothing in the chain`); log('nothing to land: no push'); return results; }
+    beforePush(attempt);
+    const { out } = git.out(['push', '--porcelain', 'origin', `${tip}:refs/heads/main`]);
+    const st = pushStatus(out);
+    log(`attempt ${attempt}: tip ${tip0.slice(0, 10)}: ${st === 'pushed' ? 'pushed' : st === 'fast-forward' ? 'refused, not a fast-forward' : 'refused, another kind'}`);
+    if (st === 'pushed') { log('pushed: these heads are on main'); log(results.filter((r) => r.landed).map((r) => `landed #${r.pr}`).join('\n')); return results; }
+    if (st !== 'fast-forward') throw new Error('the push was refused, not as a fast-forward: nothing landed, nothing forced');
+    if (attempt >= maxTries || Date.now() - began >= totalMs) throw new Error(`the push was refused as not a fast-forward ${attempt} times: nothing landed, nothing forced`);
+    pause(waitMs());
   }
-  throw new Error('the push was refused twice: nothing landed, nothing forced');
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
